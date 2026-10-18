@@ -1,21 +1,31 @@
 use crate::codec::*;
 use crate::endpoint::Endpoint;
 use crate::error::*;
+use crate::peer_map::PeerMap;
 use crate::transport::AcceptStopHandle;
-use crate::util::{Peer, PeerIdentity};
+use crate::util::PeerIdentity;
 use crate::*;
 use crate::{SocketType, ZmqResult};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use crossbeam_queue::SegQueue;
+use futures::lock::Mutex as AsyncMutex;
 use futures::{SinkExt, StreamExt};
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// The halves are shared, so a send or a recv that waits holds no lock on
+/// the peer table.
+#[derive(Clone)]
+struct ReqPeer {
+    send_queue: Arc<AsyncMutex<ZmqFramedWrite>>,
+    recv_queue: Arc<AsyncMutex<ZmqFramedRead>>,
+}
+
 struct ReqSocketBackend {
-    pub(crate) peers: scc::HashMap<PeerIdentity, Peer>,
+    pub(crate) peers: PeerMap<ReqPeer>,
     pub(crate) round_robin: SegQueue<PeerIdentity>,
     socket_monitor: Mutex<Option<mpsc::Sender<SocketEvent>>>,
     socket_options: Arc<SocketOptions>,
@@ -57,10 +67,14 @@ impl SocketSend for ReqSocket {
                     })
                 }
             };
-            if let Some(mut peer) = self.backend.peers.get_async(&next_peer_id).await {
+            if let Some(peer) = self.backend.peers.read(&next_peer_id, ReqPeer::clone) {
                 self.backend.round_robin.push(next_peer_id.clone());
                 message.push_front(Bytes::new());
-                peer.send_queue.send(Message::Message(message)).await?;
+                peer.send_queue
+                    .lock()
+                    .await
+                    .send(Message::Message(message))
+                    .await?;
                 self.current_request = Some(next_peer_id);
                 return Ok(());
             }
@@ -76,12 +90,12 @@ impl SocketRecv for ReqSocket {
             None => return Err(ZmqError::Other("Unable to recv. No request in progress")),
         };
 
-        let Some(mut peer) = self.backend.peers.get_async(&peer_id).await else {
+        let Some(peer) = self.backend.peers.read(&peer_id, ReqPeer::clone) else {
             self.current_request = None;
             return Err(ZmqError::Other("Server disconnected"));
         };
 
-        let result = match peer.recv_queue.next().await {
+        let result = match peer.recv_queue.lock().await.next().await {
             Some(Ok(Message::Message(mut m))) => {
                 if m.len() < 2 {
                     Err(ZmqError::Other("Invalid message format: too few frames"))
@@ -109,7 +123,7 @@ impl Socket for ReqSocket {
     fn with_options(options: SocketOptions) -> Self {
         Self {
             backend: Arc::new(ReqSocketBackend {
-                peers: scc::HashMap::new(),
+                peers: PeerMap::default(),
                 round_robin: SegQueue::new(),
                 socket_monitor: Mutex::new(None),
                 socket_options: Arc::new(options),
@@ -138,21 +152,18 @@ impl Socket for ReqSocket {
 impl MultiPeerBackend for ReqSocketBackend {
     async fn peer_connected(self: Arc<Self>, peer_id: &PeerIdentity, io: FramedIo) {
         let (recv_queue, send_queue) = io.into_parts();
-        self.peers
-            .upsert_async(
-                peer_id.clone(),
-                Peer {
-                    _identity: peer_id.clone(),
-                    send_queue,
-                    recv_queue,
-                },
-            )
-            .await;
+        self.peers.insert(
+            peer_id.clone(),
+            ReqPeer {
+                send_queue: Arc::new(AsyncMutex::new(send_queue)),
+                recv_queue: Arc::new(AsyncMutex::new(recv_queue)),
+            },
+        );
         self.round_robin.push(peer_id.clone());
     }
 
     fn peer_disconnected(&self, peer_id: &PeerIdentity) {
-        self.peers.remove_sync(peer_id);
+        self.peers.remove(peer_id);
     }
 }
 
@@ -166,7 +177,7 @@ impl SocketBackend for ReqSocketBackend {
     }
 
     fn shutdown(&self) {
-        self.peers.clear_sync();
+        self.peers.clear();
     }
 
     fn monitor(&self) -> &Mutex<Option<mpsc::Sender<SocketEvent>>> {

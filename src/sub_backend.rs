@@ -4,6 +4,7 @@ use crate::endpoint::Endpoint;
 use crate::error::ZmqResult;
 use crate::fair_queue::QueueInner;
 use crate::message::ZmqMessage;
+use crate::peer_map::PeerMap;
 use crate::reconnect::{ReconnectConfig, ReconnectHandle};
 use crate::transport::AcceptStopHandle;
 use crate::util::{next_connection_id, PeerIdentity};
@@ -43,7 +44,7 @@ pub(crate) struct SubPeer {
 /// When a new peer connects, all current subscriptions are automatically
 /// re-sent to ensure the peer receives the full subscription set.
 pub(crate) struct SubSocketBackend {
-    pub(crate) peers: scc::HashMap<PeerIdentity, SubPeer>,
+    pub(crate) peers: PeerMap<SubPeer>,
     fair_queue_inner: Option<Arc<Mutex<QueueInner<ZmqFramedRead, PeerIdentity>>>>,
     socket_type: SocketType,
     socket_options: Arc<SocketOptions>,
@@ -60,7 +61,7 @@ impl SubSocketBackend {
         options: SocketOptions,
     ) -> Self {
         Self {
-            peers: scc::HashMap::new(),
+            peers: PeerMap::default(),
             fair_queue_inner,
             socket_type,
             socket_options: Arc::new(options),
@@ -157,16 +158,9 @@ impl SubSocketBackend {
             return Ok(());
         }
 
-        let mut targets = Vec::new();
-        let mut iter = self.peers.begin_async().await;
-        while let Some(peer) = iter {
-            targets.push((
-                peer.key().clone(),
-                peer.connection_id,
-                peer.send_queue.clone(),
-            ));
-            iter = peer.next_async().await;
-        }
+        let targets = self.peers.collect(|peer_id, peer| {
+            Some((peer_id.clone(), peer.connection_id, peer.send_queue.clone()))
+        });
 
         let mut dead_peers = Vec::new();
         for (peer_id, connection_id, send_queue) in targets {
@@ -193,8 +187,7 @@ impl SubSocketBackend {
         }
 
         for (peer_id, connection_id) in dead_peers {
-            self.peer_disconnected_async(&peer_id, Some(connection_id))
-                .await;
+            self.connection_closed(&peer_id, connection_id);
         }
 
         Ok(())
@@ -214,16 +207,9 @@ impl SubSocketBackend {
 
     /// Reliably send a message to every connected peer using async send.
     async fn broadcast_control_message(&self, message: ZmqMessage) -> ZmqResult<()> {
-        let mut targets = Vec::new();
-        let mut iter = self.peers.begin_async().await;
-        while let Some(peer) = iter {
-            targets.push((
-                peer.key().clone(),
-                peer.connection_id,
-                peer.send_queue.clone(),
-            ));
-            iter = peer.next_async().await;
-        }
+        let targets = self.peers.collect(|peer_id, peer| {
+            Some((peer_id.clone(), peer.connection_id, peer.send_queue.clone()))
+        });
 
         let mut dead_peers = Vec::new();
         let mut first_error = None;
@@ -257,8 +243,7 @@ impl SubSocketBackend {
         }
 
         for (peer_id, connection_id) in dead_peers {
-            self.peer_disconnected_async(&peer_id, Some(connection_id))
-                .await;
+            self.connection_closed(&peer_id, connection_id);
         }
 
         first_error.map_or(Ok(()), Err)
@@ -275,7 +260,7 @@ impl SocketBackend for SubSocketBackend {
     }
 
     fn shutdown(&self) {
-        self.peers.clear_sync();
+        self.peers.clear();
         // Clear fair_queue streams to ensure TCP connections are closed
         // even when reconnect tasks still hold Arc references to the backend
         if let Some(inner) = &self.fair_queue_inner {
@@ -301,15 +286,13 @@ impl MultiPeerBackend for SubSocketBackend {
             }
         }
 
-        self.peers
-            .upsert_async(
-                peer_id.clone(),
-                SubPeer {
-                    send_queue: Arc::new(AsyncMutex::new(Box::pin(send_queue))),
-                    connection_id,
-                },
-            )
-            .await;
+        self.peers.insert(
+            peer_id.clone(),
+            SubPeer {
+                send_queue: Arc::new(AsyncMutex::new(Box::pin(send_queue))),
+                connection_id,
+            },
+        );
 
         if let Some(inner) = &self.fair_queue_inner {
             inner
@@ -320,37 +303,24 @@ impl MultiPeerBackend for SubSocketBackend {
 
     fn peer_disconnected(&self, peer_id: &PeerIdentity) {
         self.report_disconnected(peer_id);
-        self.peers.remove_sync(peer_id);
+        self.peers.remove(peer_id);
         self.forget_peer(peer_id, None);
     }
 }
 
 impl SubSocketBackend {
-    /// [`MultiPeerBackend::peer_disconnected`] for async code, which must not
-    /// wait on the peer map synchronously.
-    ///
-    /// With `Some(connection_id)` it removes the peer only if that connection
-    /// is still the registered one, and does nothing otherwise.
-    pub(crate) async fn peer_disconnected_async(
-        &self,
-        peer_id: &PeerIdentity,
-        connection_id: Option<u64>,
-    ) {
-        let removed = match connection_id {
-            Some(id) => self
-                .peers
-                .remove_if_async(peer_id, |peer| peer.connection_id == id)
-                .await
-                .is_some(),
-            None => self.peers.remove_async(peer_id).await.is_some(),
-        };
-        if connection_id.is_some() && !removed {
+    /// Removes the peer for a closed connection, but only if that connection
+    /// is still the registered one.
+    pub(crate) fn connection_closed(&self, peer_id: &PeerIdentity, connection_id: u64) {
+        if self
+            .peers
+            .remove_if(peer_id, |peer| peer.connection_id == connection_id)
+            .is_none()
+        {
             return;
         }
-        if removed {
-            self.report_disconnected(peer_id);
-        }
-        self.forget_peer(peer_id, connection_id);
+        self.report_disconnected(peer_id);
+        self.forget_peer(peer_id, Some(connection_id));
     }
 
     fn report_disconnected(&self, peer_id: &PeerIdentity) {

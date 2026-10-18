@@ -42,11 +42,7 @@ impl Socket for RouterSocket {
         let backend_weak = Arc::downgrade(&backend);
         fair_queue.set_on_disconnect(move |peer_id: PeerIdentity, connection_id: u64| {
             if let Some(backend) = backend_weak.upgrade() {
-                crate::async_rt::task::spawn(async move {
-                    backend
-                        .peer_disconnected_async(&peer_id, Some(connection_id))
-                        .await;
-                });
+                backend.connection_closed(&peer_id, connection_id);
             }
         });
 
@@ -87,7 +83,7 @@ impl SocketRecv for RouterSocket {
                     // tracing::warn!("Received unimplemented message type: {:?}", msg);
                 }
                 Some((peer_id, Err(_e))) => {
-                    self.backend.peer_disconnected_async(&peer_id, None).await;
+                    self.backend.peer_disconnected(&peer_id);
                     // We could take an approach of using `tracing` and have that be an optional feature
                     // tracing::error!("Error receiving message from peer {}: {:?}", peer_id, e);
                 }
@@ -198,10 +194,7 @@ impl SocketRecv for RouterRecvHalf {
                 }
                 Some((_peer_id, Ok(_))) => {}
                 Some((peer_id, Err(_e))) => {
-                    self.inner
-                        .backend
-                        .peer_disconnected_async(&peer_id, None)
-                        .await;
+                    self.inner.backend.peer_disconnected(&peer_id);
                 }
                 None => {
                     return Err(ZmqError::NoMessage);

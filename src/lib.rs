@@ -8,6 +8,7 @@ mod endpoint;
 mod error;
 mod fair_queue;
 mod message;
+mod peer_map;
 mod r#pub;
 mod pull;
 mod push;
@@ -69,16 +70,13 @@ pub mod __bench {
                     .parse()
                     .expect("valid peer identity");
                 let (send_queue, recv_queue) = mpsc::channel(queue_capacity);
-                backend
-                    .peers
-                    .upsert_async(
-                        peer_id.clone(),
-                        Peer {
-                            send_queue,
-                            connection_id: 0,
-                        },
-                    )
-                    .await;
+                backend.peers.insert(
+                    peer_id.clone(),
+                    Peer {
+                        send_queue,
+                        connection_id: 0,
+                    },
+                );
                 backend.round_robin.push(peer_id);
                 receivers.push(recv_queue);
             }
@@ -113,7 +111,7 @@ pub mod __bench {
             subscriptions: Vec<Vec<u8>>,
         ) -> Self {
             let backend = Arc::new(PubSocketBackend {
-                subscribers: scc::HashMap::new(),
+                subscribers: crate::peer_map::PeerMap::default(),
                 subscriber_count: AtomicUsize::new(0),
                 socket_monitor: Mutex::new(None),
                 socket_options: Arc::new(SocketOptions::default()),
@@ -126,18 +124,15 @@ pub mod __bench {
                     .expect("valid peer identity");
                 let (send_queue, recv_queue) = mpsc::channel(1024);
                 let (stop_sender, _stop_receiver) = oneshot::channel();
-                backend
-                    .subscribers
-                    .upsert_async(
-                        peer_id,
-                        Subscriber {
-                            subscriptions: subscriptions.clone(),
-                            send_queue,
-                            _subscription_coro_stop: stop_sender,
-                            connection_id: 0,
-                        },
-                    )
-                    .await;
+                backend.subscribers.insert(
+                    peer_id,
+                    Subscriber {
+                        subscriptions: subscriptions.clone(),
+                        send_queue,
+                        _subscription_coro_stop: stop_sender,
+                        connection_id: 0,
+                    },
+                );
                 backend
                     .subscriber_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -223,7 +218,6 @@ use crate::transport::AcceptStopHandle;
 use util::PeerIdentity;
 
 use async_trait::async_trait;
-use asynchronous_codec::FramedWrite;
 use futures::channel::mpsc;
 use futures::{select, FutureExt};
 use parking_lot::Mutex;

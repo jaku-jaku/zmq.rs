@@ -2,6 +2,7 @@ use crate::codec::*;
 use crate::endpoint::Endpoint;
 use crate::error::ZmqResult;
 use crate::message::*;
+use crate::peer_map::PeerMap;
 use crate::transport::AcceptStopHandle;
 use crate::util::{next_connection_id, PeerIdentity};
 use crate::write_queue::write_message_queue;
@@ -68,7 +69,7 @@ pub(crate) struct Subscriber {
 }
 
 pub(crate) struct PubSocketBackend {
-    pub(crate) subscribers: scc::HashMap<PeerIdentity, Subscriber>,
+    pub(crate) subscribers: PeerMap<Subscriber>,
     pub(crate) subscriber_count: AtomicUsize,
     pub(crate) socket_monitor: Mutex<Option<mpsc::Sender<SocketEvent>>>,
     pub(crate) socket_options: Arc<SocketOptions>,
@@ -135,16 +136,14 @@ impl PubSocketBackend {
             None => return,
         };
 
-        let mut iter = self.subscribers.begin_async().await;
-        while let Some(subscriber) = iter {
+        self.subscribers.for_each(|_, subscriber| {
             if subscription_matches(&subscriber.subscriptions, first_frame) {
                 send_to_subscriber(subscriber.send_queue.clone(), &message);
             }
-            iter = subscriber.next_async().await;
-        }
+        });
     }
 
-    async fn message_received(&self, peer_id: &PeerIdentity, message: Message) {
+    fn message_received(&self, peer_id: &PeerIdentity, message: Message) {
         let data = match message {
             Message::Message(m) => {
                 if m.len() != 1 {
@@ -163,18 +162,18 @@ impl PubSocketBackend {
         match data.first() {
             Some(1) => {
                 // Subscribe
-                if let Some(mut entry) = self.subscribers.get_async(peer_id).await {
-                    entry.subscriptions.push(Vec::from(&data[1..]));
-                }
+                self.subscribers.update(peer_id, |subscriber| {
+                    subscriber.subscriptions.push(Vec::from(&data[1..]));
+                });
             }
             Some(0) => {
                 // Unsubscribe
                 let sub = Vec::from(&data[1..]);
-                if let Some(mut entry) = self.subscribers.get_async(peer_id).await {
-                    if let Some(index) = entry.subscriptions.iter().position(|s| s == &sub) {
-                        entry.subscriptions.remove(index);
+                self.subscribers.update(peer_id, |subscriber| {
+                    if let Some(index) = subscriber.subscriptions.iter().position(|s| s == &sub) {
+                        subscriber.subscriptions.remove(index);
                     }
-                }
+                });
             }
             _ => log::warn!(
                 "Received message with unexpected first byte: {:?}",
@@ -194,7 +193,7 @@ impl SocketBackend for PubSocketBackend {
     }
 
     fn shutdown(&self) {
-        self.subscribers.clear_sync();
+        self.subscribers.clear();
         self.subscriber_count.store(0, Ordering::Relaxed);
     }
 
@@ -211,18 +210,15 @@ impl MultiPeerBackend for PubSocketBackend {
         let (queue_sender, queue_receiver) = mpsc::channel(PUB_SEND_QUEUE_CAPACITY);
         let (sender, stop_receiver) = oneshot::channel();
         let connection_id = next_connection_id();
-        let old_subscriber = self
-            .subscribers
-            .upsert_async(
-                peer_id.clone(),
-                Subscriber {
-                    subscriptions: vec![],
-                    send_queue: queue_sender,
-                    _subscription_coro_stop: sender,
-                    connection_id,
-                },
-            )
-            .await;
+        let old_subscriber = self.subscribers.insert(
+            peer_id.clone(),
+            Subscriber {
+                subscriptions: vec![],
+                send_queue: queue_sender,
+                _subscription_coro_stop: sender,
+                connection_id,
+            },
+        );
         if old_subscriber.is_none() {
             self.subscriber_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -235,9 +231,7 @@ impl MultiPeerBackend for PubSocketBackend {
                     writer_peer_id,
                     error
                 );
-                writer_backend
-                    .peer_disconnected_async(&writer_peer_id, connection_id)
-                    .await;
+                writer_backend.connection_closed(&writer_peer_id, connection_id);
             }
         });
         let backend = self;
@@ -251,14 +245,14 @@ impl MultiPeerBackend for PubSocketBackend {
                      },
                      message = recv_queue.next().fuse() => {
                         match message {
-                            Some(Ok(m)) => backend.message_received(&peer_id, m).await,
+                            Some(Ok(m)) => backend.message_received(&peer_id, m),
                             Some(Err(e)) => {
                                 log::debug!("Error receiving message: {:?}", e);
-                                backend.peer_disconnected_async(&peer_id, connection_id).await;
+                                backend.connection_closed(&peer_id, connection_id);
                                 break;
                             }
                             None => {
-                                backend.peer_disconnected_async(&peer_id, connection_id).await;
+                                backend.connection_closed(&peer_id, connection_id);
                                 break
                             }
                         }
@@ -274,23 +268,19 @@ impl MultiPeerBackend for PubSocketBackend {
         if let Some(monitor) = self.monitor().lock().as_mut() {
             let _ = monitor.try_send(SocketEvent::Disconnected(peer_id.clone()));
         }
-        if self.subscribers.remove_sync(peer_id).is_some() {
+        if self.subscribers.remove(peer_id).is_some() {
             self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
 
 impl PubSocketBackend {
-    /// [`MultiPeerBackend::peer_disconnected`] for the subscriber's own tasks.
-    /// They run on the runtime, so they must not wait on the subscriber map
-    /// synchronously, and they remove only their own connection.
-    async fn peer_disconnected_async(&self, peer_id: &PeerIdentity, connection_id: u64) {
-        let removed = self
-            .subscribers
-            .remove_if_async(peer_id, |subscriber| {
-                subscriber.connection_id == connection_id
-            })
-            .await;
+    /// Removes the subscriber for a closed connection, but only if that
+    /// connection is still the registered one.
+    fn connection_closed(&self, peer_id: &PeerIdentity, connection_id: u64) {
+        let removed = self.subscribers.remove_if(peer_id, |subscriber| {
+            subscriber.connection_id == connection_id
+        });
         if removed.is_none() {
             return;
         }
@@ -335,7 +325,7 @@ impl CaptureSocket for PubSocket {}
 impl Socket for PubSocket {
     fn with_options(options: SocketOptions) -> Self {
         let backend = Arc::new(PubSocketBackend {
-            subscribers: scc::HashMap::new(),
+            subscribers: PeerMap::default(),
             subscriber_count: AtomicUsize::new(0),
             socket_monitor: Mutex::new(None),
             socket_options: Arc::new(options),
@@ -375,7 +365,7 @@ mod tests {
 
     fn test_backend() -> PubSocketBackend {
         PubSocketBackend {
-            subscribers: scc::HashMap::new(),
+            subscribers: PeerMap::default(),
             subscriber_count: AtomicUsize::new(0),
             socket_monitor: Mutex::new(None),
             socket_options: Arc::new(SocketOptions::default()),
@@ -389,18 +379,15 @@ mod tests {
         queue_sender: PubSendQueue,
     ) {
         let (stop_sender, _stop_receiver) = oneshot::channel();
-        let old_subscriber = backend
-            .subscribers
-            .upsert_async(
-                peer_id,
-                Subscriber {
-                    subscriptions,
-                    send_queue: queue_sender,
-                    _subscription_coro_stop: stop_sender,
-                    connection_id: 0,
-                },
-            )
-            .await;
+        let old_subscriber = backend.subscribers.insert(
+            peer_id,
+            Subscriber {
+                subscriptions,
+                send_queue: queue_sender,
+                _subscription_coro_stop: stop_sender,
+                connection_id: 0,
+            },
+        );
         if old_subscriber.is_none() {
             backend.subscriber_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -575,8 +562,8 @@ mod tests {
         };
         assert_eq!(message.get(0), Some(&Bytes::from_static(b"payload")));
 
-        assert!(backend.subscribers.get_sync(&stale_peer).is_some());
-        assert!(backend.subscribers.get_sync(&live_peer).is_some());
+        assert!(backend.subscribers.contains(&stale_peer));
+        assert!(backend.subscribers.contains(&live_peer));
         assert_eq!(backend.subscriber_count.load(Ordering::Relaxed), 2);
     }
 
@@ -612,7 +599,7 @@ mod tests {
 
         send_to_subscriber(queue_sender, &ZmqMessage::from("dropped payload"));
 
-        assert!(backend.subscribers.get_sync(&peer_id).is_some());
+        assert!(backend.subscribers.contains(&peer_id));
         assert_eq!(backend.subscriber_count.load(Ordering::Relaxed), 1);
 
         let mut queued_messages = Vec::new();
@@ -649,7 +636,7 @@ mod tests {
 
         send_to_subscriber(queue_sender, &ZmqMessage::from("payload"));
 
-        assert!(backend.subscribers.get_sync(&peer_id).is_some());
+        assert!(backend.subscribers.contains(&peer_id));
         assert_eq!(backend.subscriber_count.load(Ordering::Relaxed), 1);
     }
 

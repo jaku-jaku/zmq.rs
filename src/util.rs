@@ -1,4 +1,4 @@
-use crate::codec::{CodecResult, FramedIo, ZmqFramedRead};
+use crate::codec::{CodecResult, FramedIo};
 use crate::*;
 
 use bytes::Bytes;
@@ -106,12 +106,6 @@ impl From<PeerIdentity> for Vec<u8> {
     fn from(p_id: PeerIdentity) -> Self {
         p_id.0.to_vec()
     }
-}
-
-pub(crate) struct Peer {
-    pub(crate) _identity: PeerIdentity,
-    pub(crate) send_queue: FramedWrite<Box<dyn FrameableWrite>, ZmqCodec>,
-    pub(crate) recv_queue: ZmqFramedRead,
 }
 
 /// Given the result of the greetings exchange, determines the version of the

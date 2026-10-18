@@ -3,6 +3,7 @@ use crate::endpoint::Endpoint;
 use crate::error::ZmqResult;
 use crate::fair_queue::{FairQueue, QueueInner};
 use crate::message::*;
+use crate::peer_map::PeerMap;
 use crate::transport::AcceptStopHandle;
 use crate::util::{next_connection_id, PeerIdentity};
 use crate::{CaptureSocket, SocketOptions};
@@ -29,14 +30,14 @@ pub(crate) struct XPubSubscriber {
 }
 
 pub(crate) struct XPubSocketBackend {
-    subscribers: scc::HashMap<PeerIdentity, XPubSubscriber>,
+    subscribers: PeerMap<XPubSubscriber>,
     fair_queue_inner: Arc<Mutex<QueueInner<ZmqFramedRead, PeerIdentity>>>,
     socket_monitor: Mutex<Option<mpsc::Sender<SocketEvent>>>,
     socket_options: Arc<SocketOptions>,
 }
 
 impl XPubSocketBackend {
-    async fn message_received(&self, peer_id: &PeerIdentity, message: Message) {
+    fn message_received(&self, peer_id: &PeerIdentity, message: Message) {
         let data = match message {
             Message::Message(m) => {
                 if m.len() != 1 {
@@ -54,18 +55,18 @@ impl XPubSocketBackend {
         match data.first() {
             Some(1) => {
                 // Subscribe
-                if let Some(mut entry) = self.subscribers.get_async(peer_id).await {
-                    entry.subscriptions.push(Vec::from(&data[1..]));
-                }
+                self.subscribers.update(peer_id, |subscriber| {
+                    subscriber.subscriptions.push(Vec::from(&data[1..]));
+                });
             }
             Some(0) => {
                 // Unsubscribe
                 let sub = Vec::from(&data[1..]);
-                if let Some(mut entry) = self.subscribers.get_async(peer_id).await {
-                    if let Some(index) = entry.subscriptions.iter().position(|s| s == &sub) {
-                        entry.subscriptions.remove(index);
+                self.subscribers.update(peer_id, |subscriber| {
+                    if let Some(index) = subscriber.subscriptions.iter().position(|s| s == &sub) {
+                        subscriber.subscriptions.remove(index);
                     }
-                }
+                });
             }
             _ => {}
         }
@@ -82,7 +83,7 @@ impl SocketBackend for XPubSocketBackend {
     }
 
     fn shutdown(&self) {
-        self.subscribers.clear_sync();
+        self.subscribers.clear();
     }
 
     fn monitor(&self) -> &Mutex<Option<mpsc::Sender<SocketEvent>>> {
@@ -96,16 +97,14 @@ impl MultiPeerBackend for XPubSocketBackend {
         let (recv_queue, send_queue) = io.into_parts();
         let connection_id = next_connection_id();
 
-        self.subscribers
-            .upsert_async(
-                peer_id.clone(),
-                XPubSubscriber {
-                    subscriptions: vec![],
-                    send_queue: Arc::new(AsyncMutex::new(Box::pin(send_queue))),
-                    connection_id,
-                },
-            )
-            .await;
+        self.subscribers.insert(
+            peer_id.clone(),
+            XPubSubscriber {
+                subscriptions: vec![],
+                send_queue: Arc::new(AsyncMutex::new(Box::pin(send_queue))),
+                connection_id,
+            },
+        );
 
         self.fair_queue_inner
             .lock()
@@ -114,31 +113,27 @@ impl MultiPeerBackend for XPubSocketBackend {
 
     fn peer_disconnected(&self, peer_id: &PeerIdentity) {
         log::info!("Client disconnected {:?}", peer_id);
-        self.subscribers.remove_sync(peer_id);
+        self.subscribers.remove(peer_id);
         self.fair_queue_inner.lock().remove(peer_id);
     }
 }
 
 impl XPubSocketBackend {
-    /// [`MultiPeerBackend::peer_disconnected`] for async code, which must not
-    /// wait on the subscriber map synchronously.
-    ///
-    /// With `Some(connection_id)` it removes the subscriber only if that
-    /// connection is still the registered one, and does nothing otherwise.
-    async fn peer_disconnected_async(&self, peer_id: &PeerIdentity, connection_id: Option<u64>) {
-        if let Some(id) = connection_id {
-            let removed = self
-                .subscribers
-                .remove_if_async(peer_id, |subscriber| subscriber.connection_id == id)
-                .await;
-            if removed.is_none() {
-                return;
-            }
-            self.fair_queue_inner.lock().remove_connection(peer_id, id);
-        } else {
-            self.subscribers.remove_async(peer_id).await;
-            self.fair_queue_inner.lock().remove(peer_id);
+    /// Removes the subscriber for a closed connection, but only if that
+    /// connection is still the registered one.
+    fn connection_closed(&self, peer_id: &PeerIdentity, connection_id: u64) {
+        if self
+            .subscribers
+            .remove_if(peer_id, |subscriber| {
+                subscriber.connection_id == connection_id
+            })
+            .is_none()
+        {
+            return;
         }
+        self.fair_queue_inner
+            .lock()
+            .remove_connection(peer_id, connection_id);
         log::info!("Client disconnected {:?}", peer_id);
     }
 }
@@ -162,21 +157,22 @@ impl SocketSend for XPubSocket {
             Some(frame) => frame,
             None => return Ok(()), // Empty message, nothing to publish
         };
-        let mut targets = Vec::new();
-        let mut iter = self.backend.subscribers.begin_async().await;
-        while let Some(subscriber) = iter {
-            if subscriber.subscriptions.iter().any(|sub_filter| {
-                sub_filter.len() <= first_frame.len()
-                    && sub_filter.as_slice() == &first_frame[0..sub_filter.len()]
-            }) {
-                targets.push((
-                    subscriber.key().clone(),
-                    subscriber.connection_id,
-                    subscriber.send_queue.clone(),
-                ));
-            }
-            iter = subscriber.next_async().await;
-        }
+        let targets = self.backend.subscribers.collect(|peer_id, subscriber| {
+            subscriber
+                .subscriptions
+                .iter()
+                .any(|sub_filter| {
+                    sub_filter.len() <= first_frame.len()
+                        && sub_filter.as_slice() == &first_frame[0..sub_filter.len()]
+                })
+                .then(|| {
+                    (
+                        peer_id.clone(),
+                        subscriber.connection_id,
+                        subscriber.send_queue.clone(),
+                    )
+                })
+        });
 
         let mut dead_peers = Vec::new();
         for (peer_id, connection_id, send_queue) in targets {
@@ -202,9 +198,7 @@ impl SocketSend for XPubSocket {
             }
         }
         for (peer_id, connection_id) in dead_peers {
-            self.backend
-                .peer_disconnected_async(&peer_id, Some(connection_id))
-                .await;
+            self.backend.connection_closed(&peer_id, connection_id);
         }
         Ok(())
     }
@@ -218,8 +212,7 @@ impl SocketRecv for XPubSocket {
                 Some((peer_id, Ok(Message::Message(message)))) => {
                     // Process the subscription message internally to update tracking
                     self.backend
-                        .message_received(&peer_id, Message::Message(message.clone()))
-                        .await;
+                        .message_received(&peer_id, Message::Message(message.clone()));
                     // Also expose it to the application
                     return Ok(message);
                 }
@@ -227,7 +220,7 @@ impl SocketRecv for XPubSocket {
                     // Ignore non-message frames
                 }
                 Some((peer_id, Err(e))) => {
-                    self.backend.peer_disconnected_async(&peer_id, None).await;
+                    self.backend.peer_disconnected(&peer_id);
                     return Err(e.into());
                 }
                 None => {
@@ -245,7 +238,7 @@ impl Socket for XPubSocket {
     fn with_options(options: SocketOptions) -> Self {
         let mut fair_queue = FairQueue::new(true);
         let backend = Arc::new(XPubSocketBackend {
-            subscribers: scc::HashMap::new(),
+            subscribers: PeerMap::default(),
             fair_queue_inner: fair_queue.inner(),
             socket_monitor: Mutex::new(None),
             socket_options: Arc::new(options),
@@ -254,11 +247,7 @@ impl Socket for XPubSocket {
         let backend_weak = Arc::downgrade(&backend);
         fair_queue.set_on_disconnect(move |peer_id: PeerIdentity, connection_id: u64| {
             if let Some(backend) = backend_weak.upgrade() {
-                crate::async_rt::task::spawn(async move {
-                    backend
-                        .peer_disconnected_async(&peer_id, Some(connection_id))
-                        .await;
-                });
+                backend.connection_closed(&peer_id, connection_id);
             }
         });
 

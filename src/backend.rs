@@ -1,6 +1,7 @@
 use crate::async_rt;
 use crate::codec::{FramedIo, Message, ZmqFramedRead};
 use crate::fair_queue::QueueInner;
+use crate::peer_map::PeerMap;
 use crate::util::{next_connection_id, PeerIdentity};
 use crate::write_queue::write_message_queue;
 use crate::{
@@ -55,7 +56,7 @@ enum SendResolution {
 }
 
 pub(crate) struct GenericSocketBackend {
-    pub(crate) peers: scc::HashMap<PeerIdentity, Peer>,
+    pub(crate) peers: PeerMap<Peer>,
     fair_queue_inner: Option<Arc<Mutex<QueueInner<ZmqFramedRead, PeerIdentity>>>>,
     pub(crate) round_robin: SegQueue<PeerIdentity>,
     socket_type: SocketType,
@@ -74,7 +75,7 @@ impl GenericSocketBackend {
         options: SocketOptions,
     ) -> Self {
         Self {
-            peers: scc::HashMap::new(),
+            peers: PeerMap::default(),
             fair_queue_inner,
             round_robin: SegQueue::new(),
             socket_type,
@@ -136,8 +137,7 @@ impl GenericSocketBackend {
                     }
                 },
             };
-            let Some((mut send_queue, connection_id)) = self.peer_sender(&next_peer_id).await
-            else {
+            let Some((mut send_queue, connection_id)) = self.peer_sender(&next_peer_id) else {
                 continue;
             };
             return match send_to_peer_queue(&mut send_queue, message).await {
@@ -146,8 +146,7 @@ impl GenericSocketBackend {
                     Ok(())
                 }
                 Err(e) => {
-                    self.peer_disconnected_async(&next_peer_id, Some(connection_id))
-                        .await;
+                    self.connection_closed(&next_peer_id, connection_id);
                     Err(e.into())
                 }
             };
@@ -167,27 +166,24 @@ impl GenericSocketBackend {
             SendResolution::Miss(message) => message,
         };
 
-        let Some((mut send_queue, connection_id)) = self.peer_sender(peer_id).await else {
+        let Some((mut send_queue, connection_id)) = self.peer_sender(peer_id) else {
             return Err(ZmqError::Other("Destination client not found by identity"));
         };
         match send_to_peer_queue(&mut send_queue, message).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                self.peer_disconnected_async(peer_id, Some(connection_id))
-                    .await;
+                self.connection_closed(peer_id, connection_id);
                 Err(e.into())
             }
         }
     }
 
-    /// Clones the peer's sender out of the map, so no map entry is held while
-    /// a send waits for queue space.
-    async fn peer_sender(&self, peer_id: &PeerIdentity) -> Option<(mpsc::Sender<Message>, u64)> {
-        self.peers
-            .read_async(peer_id, |_, peer| {
-                (peer.send_queue.clone(), peer.connection_id)
-            })
-            .await
+    /// Clones the peer's sender out of the map, so a send that waits for
+    /// queue space holds no lock.
+    fn peer_sender(&self, peer_id: &PeerIdentity) -> Option<(mpsc::Sender<Message>, u64)> {
+        self.peers.read(peer_id, |peer| {
+            (peer.send_queue.clone(), peer.connection_id)
+        })
     }
 
     fn try_send_cached_single_peer(
@@ -237,8 +233,7 @@ impl GenericSocketBackend {
             } => match send_queue.send(message).await {
                 Ok(()) => Ok(SendResolution::Sent),
                 Err(e) => {
-                    self.peer_disconnected_async(&peer_id, Some(connection_id))
-                        .await;
+                    self.connection_closed(&peer_id, connection_id);
                     Err(e.into())
                 }
             },
@@ -247,8 +242,7 @@ impl GenericSocketBackend {
                 connection_id,
                 error,
             } => {
-                self.peer_disconnected_async(&peer_id, Some(connection_id))
-                    .await;
+                self.connection_closed(&peer_id, connection_id);
                 Err(error.into())
             }
             CachedSend::Miss(message) => Ok(SendResolution::Miss(message)),
@@ -256,19 +250,13 @@ impl GenericSocketBackend {
     }
 
     fn refresh_single_peer_cache(&self) {
-        let peer_count = self.peers.len();
+        let (peer_count, single_peer) = self.peers.single(|peer_id, peer| SinglePeer {
+            peer_id: peer_id.clone(),
+            send_queue: peer.send_queue.clone(),
+            connection_id: peer.connection_id,
+        });
         self.peer_count.store(peer_count, Ordering::Release);
-
-        let mut single_peer = self.single_peer.lock();
-        if peer_count == 1 {
-            *single_peer = self.peers.begin_sync().map(|peer| SinglePeer {
-                peer_id: peer.key().clone(),
-                send_queue: peer.send_queue.clone(),
-                connection_id: peer.connection_id,
-            });
-        } else {
-            *single_peer = None;
-        }
+        *self.single_peer.lock() = single_peer;
     }
 }
 
@@ -293,7 +281,7 @@ impl SocketBackend for GenericSocketBackend {
     }
 
     fn shutdown(&self) {
-        self.peers.clear_sync();
+        self.peers.clear();
         self.single_peer.lock().take();
         self.peer_count.store(0, Ordering::Release);
         // Clear fair_queue streams to ensure TCP connections are closed
@@ -314,16 +302,14 @@ impl MultiPeerBackend for GenericSocketBackend {
         let (recv_queue, send_queue) = io.into_parts();
         let (queue_sender, queue_receiver) = mpsc::channel(PEER_SEND_QUEUE_CAPACITY);
         let connection_id = next_connection_id();
-        self.peers
-            .upsert_async(
-                peer_id.clone(),
-                Peer {
-                    send_queue: queue_sender,
-                    connection_id,
-                },
-            )
-            .await;
-        self.refresh_single_peer_cache_async().await;
+        self.peers.insert(
+            peer_id.clone(),
+            Peer {
+                send_queue: queue_sender,
+                connection_id,
+            },
+        );
+        self.refresh_single_peer_cache();
         let writer_backend = self.clone();
         let writer_peer_id = peer_id.clone();
         async_rt::task::spawn(async move {
@@ -333,9 +319,7 @@ impl MultiPeerBackend for GenericSocketBackend {
                     writer_peer_id,
                     error
                 );
-                writer_backend
-                    .peer_disconnected_async(&writer_peer_id, Some(connection_id))
-                    .await;
+                writer_backend.connection_closed(&writer_peer_id, connection_id);
             }
         });
         self.round_robin.push(peer_id.clone());
@@ -350,52 +334,26 @@ impl MultiPeerBackend for GenericSocketBackend {
     }
 
     fn peer_disconnected(&self, peer_id: &PeerIdentity) {
-        let peer_removed = self.peers.remove_sync(peer_id).is_some();
+        let peer_removed = self.peers.remove(peer_id).is_some();
         self.refresh_single_peer_cache();
         self.forget_peer(peer_id, None, peer_removed);
     }
 }
 
 impl GenericSocketBackend {
-    /// [`MultiPeerBackend::peer_disconnected`] for async code. A sync wait on
-    /// the peer map can park a runtime thread while the lock belongs to a task
-    /// queued on that thread, so async code must use this one.
-    ///
-    /// With `Some(connection_id)` it removes the peer only if that connection
-    /// is still the registered one, and does nothing otherwise.
-    pub(crate) async fn peer_disconnected_async(
-        &self,
-        peer_id: &PeerIdentity,
-        connection_id: Option<u64>,
-    ) {
-        let peer_removed = match connection_id {
-            Some(id) => self
-                .peers
-                .remove_if_async(peer_id, |peer| peer.connection_id == id)
-                .await
-                .is_some(),
-            None => self.peers.remove_async(peer_id).await.is_some(),
-        };
-        if connection_id.is_some() && !peer_removed {
+    /// Removes the peer for a closed connection, but only if that connection
+    /// is still the registered one: the identity can already belong to a
+    /// newer connection.
+    pub(crate) fn connection_closed(&self, peer_id: &PeerIdentity, connection_id: u64) {
+        if self
+            .peers
+            .remove_if(peer_id, |peer| peer.connection_id == connection_id)
+            .is_none()
+        {
             return;
         }
-        self.refresh_single_peer_cache_async().await;
-        self.forget_peer(peer_id, connection_id, peer_removed);
-    }
-
-    async fn refresh_single_peer_cache_async(&self) {
-        let peer_count = self.peers.len();
-        let single_peer = if peer_count == 1 {
-            self.peers.begin_async().await.map(|peer| SinglePeer {
-                peer_id: peer.key().clone(),
-                send_queue: peer.send_queue.clone(),
-                connection_id: peer.connection_id,
-            })
-        } else {
-            None
-        };
-        self.peer_count.store(peer_count, Ordering::Release);
-        *self.single_peer.lock() = single_peer;
+        self.refresh_single_peer_cache();
+        self.forget_peer(peer_id, Some(connection_id), true);
     }
 
     fn forget_peer(&self, peer_id: &PeerIdentity, connection_id: Option<u64>, peer_removed: bool) {
@@ -444,16 +402,13 @@ mod tests {
         peer_id: PeerIdentity,
     ) -> (PeerIdentity, mpsc::Receiver<Message>) {
         let (send_queue, recv_queue) = mpsc::channel(8);
-        backend
-            .peers
-            .upsert_async(
-                peer_id.clone(),
-                Peer {
-                    send_queue,
-                    connection_id: 0,
-                },
-            )
-            .await;
+        backend.peers.insert(
+            peer_id.clone(),
+            Peer {
+                send_queue,
+                connection_id: 0,
+            },
+        );
         backend.refresh_single_peer_cache();
         backend.round_robin.push(peer_id.clone());
         (peer_id, recv_queue)
@@ -534,16 +489,13 @@ mod tests {
         send_queue
             .try_send(message_with_frame(b"prefilled"))
             .expect("prefill peer queue");
-        backend
-            .peers
-            .upsert_async(
-                peer_id.clone(),
-                Peer {
-                    send_queue,
-                    connection_id: 0,
-                },
-            )
-            .await;
+        backend.peers.insert(
+            peer_id.clone(),
+            Peer {
+                send_queue,
+                connection_id: 0,
+            },
+        );
         backend.refresh_single_peer_cache();
         backend.round_robin.push(peer_id.clone());
 
@@ -571,16 +523,13 @@ mod tests {
         let peer_id: PeerIdentity = "closed-peer".parse().expect("peer id");
         let (send_queue, recv_queue) = mpsc::channel(1);
         drop(recv_queue);
-        backend
-            .peers
-            .upsert_async(
-                peer_id.clone(),
-                Peer {
-                    send_queue,
-                    connection_id: 0,
-                },
-            )
-            .await;
+        backend.peers.insert(
+            peer_id.clone(),
+            Peer {
+                send_queue,
+                connection_id: 0,
+            },
+        );
         backend.refresh_single_peer_cache();
         backend.round_robin.push(peer_id.clone());
 
@@ -592,7 +541,7 @@ mod tests {
         assert!(matches!(error, ZmqError::BufferFull(_)));
         assert_eq!(0, backend.peer_count.load(Ordering::Acquire));
         assert!(backend.single_peer.lock().is_none());
-        assert!(backend.peers.get_async(&peer_id).await.is_none());
+        assert!(!backend.peers.contains(&peer_id));
     }
 
     #[crate::async_rt::test]
@@ -616,35 +565,24 @@ mod tests {
         assert!(monitor_receiver.try_recv().is_err());
     }
 
-    #[crate::async_rt::test]
-    async fn a_late_disconnect_of_an_old_connection_keeps_the_new_one() {
+    #[test]
+    fn a_late_disconnect_of_an_old_connection_keeps_the_new_one() {
         let backend =
             GenericSocketBackend::with_options(None, SocketType::ROUTER, SocketOptions::default());
         let peer_id: PeerIdentity = "peer-a".parse().expect("peer id");
         let (send_queue, _recv_queue) = mpsc::channel(8);
-        backend
-            .peers
-            .upsert_async(
-                peer_id.clone(),
-                Peer {
-                    send_queue,
-                    connection_id: 2,
-                },
-            )
-            .await;
+        backend.peers.insert(
+            peer_id.clone(),
+            Peer {
+                send_queue,
+                connection_id: 2,
+            },
+        );
 
-        backend.peer_disconnected_async(&peer_id, Some(1)).await;
-        assert!(backend
-            .peers
-            .read_async(&peer_id, |_, _| ())
-            .await
-            .is_some());
+        backend.connection_closed(&peer_id, 1);
+        assert!(backend.peers.contains(&peer_id));
 
-        backend.peer_disconnected_async(&peer_id, Some(2)).await;
-        assert!(backend
-            .peers
-            .read_async(&peer_id, |_, _| ())
-            .await
-            .is_none());
+        backend.connection_closed(&peer_id, 2);
+        assert!(!backend.peers.contains(&peer_id));
     }
 }

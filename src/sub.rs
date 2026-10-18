@@ -72,11 +72,7 @@ impl Socket for SubSocket {
         let backend_weak = Arc::downgrade(&backend);
         fair_queue.set_on_disconnect(move |peer_id: PeerIdentity, connection_id: u64| {
             if let Some(backend) = backend_weak.upgrade() {
-                crate::async_rt::task::spawn(async move {
-                    backend
-                        .peer_disconnected_async(&peer_id, Some(connection_id))
-                        .await;
-                });
+                backend.connection_closed(&peer_id, connection_id);
             }
         });
 
@@ -127,7 +123,7 @@ impl SocketRecv for SubSocket {
                     // not internal protocol frames like commands or greetings.
                 }
                 Some((peer_id, Err(e))) => {
-                    self.backend.peer_disconnected_async(&peer_id, None).await;
+                    self.backend.peer_disconnected(&peer_id);
                     // Handle potential errors from the fair queue
                     return Err(e.into());
                 }

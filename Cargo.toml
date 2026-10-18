@@ -44,7 +44,6 @@ tokio = { version = "1", default-features = false, features = [
     "time",
 ], optional = true }
 tokio-util = { version = "0.7", default-features = false, features = ["compat"], optional = true }
-scc = "3.7"
 crossbeam-queue = "0.3"
 uuid = { version = "1", default-features = false, features = ["v4"] }
 regex = { version = "1", default-features = false, features = ["std"] }
