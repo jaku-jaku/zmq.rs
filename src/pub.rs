@@ -3,7 +3,7 @@ use crate::endpoint::Endpoint;
 use crate::error::ZmqResult;
 use crate::message::*;
 use crate::transport::AcceptStopHandle;
-use crate::util::PeerIdentity;
+use crate::util::{next_connection_id, PeerIdentity};
 use crate::write_queue::write_message_queue;
 use crate::{async_rt, CaptureSocket, SocketOptions};
 use crate::{MultiPeerBackend, Socket, SocketBackend, SocketEvent, SocketSend, SocketType};
@@ -64,6 +64,7 @@ pub(crate) struct Subscriber {
     pub(crate) subscriptions: Vec<Vec<u8>>,
     pub(crate) send_queue: PubSendQueue,
     pub(crate) _subscription_coro_stop: oneshot::Sender<()>,
+    pub(crate) connection_id: u64,
 }
 
 pub(crate) struct PubSocketBackend {
@@ -143,7 +144,7 @@ impl PubSocketBackend {
         }
     }
 
-    fn message_received(&self, peer_id: &PeerIdentity, message: Message) {
+    async fn message_received(&self, peer_id: &PeerIdentity, message: Message) {
         let data = match message {
             Message::Message(m) => {
                 if m.len() != 1 {
@@ -162,14 +163,14 @@ impl PubSocketBackend {
         match data.first() {
             Some(1) => {
                 // Subscribe
-                if let Some(mut entry) = self.subscribers.get_sync(peer_id) {
+                if let Some(mut entry) = self.subscribers.get_async(peer_id).await {
                     entry.subscriptions.push(Vec::from(&data[1..]));
                 }
             }
             Some(0) => {
                 // Unsubscribe
                 let sub = Vec::from(&data[1..]);
-                if let Some(mut entry) = self.subscribers.get_sync(peer_id) {
+                if let Some(mut entry) = self.subscribers.get_async(peer_id).await {
                     if let Some(index) = entry.subscriptions.iter().position(|s| s == &sub) {
                         entry.subscriptions.remove(index);
                     }
@@ -209,6 +210,7 @@ impl MultiPeerBackend for PubSocketBackend {
         // TODO provide handling for recv_queue
         let (queue_sender, queue_receiver) = mpsc::channel(PUB_SEND_QUEUE_CAPACITY);
         let (sender, stop_receiver) = oneshot::channel();
+        let connection_id = next_connection_id();
         let old_subscriber = self
             .subscribers
             .upsert_async(
@@ -217,6 +219,7 @@ impl MultiPeerBackend for PubSocketBackend {
                     subscriptions: vec![],
                     send_queue: queue_sender,
                     _subscription_coro_stop: sender,
+                    connection_id,
                 },
             )
             .await;
@@ -232,7 +235,9 @@ impl MultiPeerBackend for PubSocketBackend {
                     writer_peer_id,
                     error
                 );
-                writer_backend.peer_disconnected(&writer_peer_id);
+                writer_backend
+                    .peer_disconnected_async(&writer_peer_id, connection_id)
+                    .await;
             }
         });
         let backend = self;
@@ -246,14 +251,14 @@ impl MultiPeerBackend for PubSocketBackend {
                      },
                      message = recv_queue.next().fuse() => {
                         match message {
-                            Some(Ok(m)) => backend.message_received(&peer_id, m),
+                            Some(Ok(m)) => backend.message_received(&peer_id, m).await,
                             Some(Err(e)) => {
                                 log::debug!("Error receiving message: {:?}", e);
-                                backend.peer_disconnected(&peer_id);
+                                backend.peer_disconnected_async(&peer_id, connection_id).await;
                                 break;
                             }
                             None => {
-                                backend.peer_disconnected(&peer_id);
+                                backend.peer_disconnected_async(&peer_id, connection_id).await;
                                 break
                             }
                         }
@@ -272,6 +277,28 @@ impl MultiPeerBackend for PubSocketBackend {
         if self.subscribers.remove_sync(peer_id).is_some() {
             self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+}
+
+impl PubSocketBackend {
+    /// [`MultiPeerBackend::peer_disconnected`] for the subscriber's own tasks.
+    /// They run on the runtime, so they must not wait on the subscriber map
+    /// synchronously, and they remove only their own connection.
+    async fn peer_disconnected_async(&self, peer_id: &PeerIdentity, connection_id: u64) {
+        let removed = self
+            .subscribers
+            .remove_if_async(peer_id, |subscriber| {
+                subscriber.connection_id == connection_id
+            })
+            .await;
+        if removed.is_none() {
+            return;
+        }
+        log::info!("Client disconnected {:?}", peer_id);
+        if let Some(monitor) = self.monitor().lock().as_mut() {
+            let _ = monitor.try_send(SocketEvent::Disconnected(peer_id.clone()));
+        }
+        self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -370,6 +397,7 @@ mod tests {
                     subscriptions,
                     send_queue: queue_sender,
                     _subscription_coro_stop: stop_sender,
+                    connection_id: 0,
                 },
             )
             .await;

@@ -4,7 +4,7 @@ use crate::error::ZmqResult;
 use crate::fair_queue::{FairQueue, QueueInner};
 use crate::message::*;
 use crate::transport::AcceptStopHandle;
-use crate::util::PeerIdentity;
+use crate::util::{next_connection_id, PeerIdentity};
 use crate::{CaptureSocket, SocketOptions};
 use crate::{
     MultiPeerBackend, Socket, SocketBackend, SocketEvent, SocketRecv, SocketSend, SocketType,
@@ -25,6 +25,7 @@ use std::sync::Arc;
 pub(crate) struct XPubSubscriber {
     pub(crate) subscriptions: Vec<Vec<u8>>,
     pub(crate) send_queue: Arc<AsyncMutex<Pin<Box<ZmqFramedWrite>>>>,
+    pub(crate) connection_id: u64,
 }
 
 pub(crate) struct XPubSocketBackend {
@@ -35,7 +36,7 @@ pub(crate) struct XPubSocketBackend {
 }
 
 impl XPubSocketBackend {
-    fn message_received(&self, peer_id: &PeerIdentity, message: Message) {
+    async fn message_received(&self, peer_id: &PeerIdentity, message: Message) {
         let data = match message {
             Message::Message(m) => {
                 if m.len() != 1 {
@@ -53,14 +54,14 @@ impl XPubSocketBackend {
         match data.first() {
             Some(1) => {
                 // Subscribe
-                if let Some(mut entry) = self.subscribers.get_sync(peer_id) {
+                if let Some(mut entry) = self.subscribers.get_async(peer_id).await {
                     entry.subscriptions.push(Vec::from(&data[1..]));
                 }
             }
             Some(0) => {
                 // Unsubscribe
                 let sub = Vec::from(&data[1..]);
-                if let Some(mut entry) = self.subscribers.get_sync(peer_id) {
+                if let Some(mut entry) = self.subscribers.get_async(peer_id).await {
                     if let Some(index) = entry.subscriptions.iter().position(|s| s == &sub) {
                         entry.subscriptions.remove(index);
                     }
@@ -93,6 +94,7 @@ impl SocketBackend for XPubSocketBackend {
 impl MultiPeerBackend for XPubSocketBackend {
     async fn peer_connected(self: Arc<Self>, peer_id: &PeerIdentity, io: FramedIo) {
         let (recv_queue, send_queue) = io.into_parts();
+        let connection_id = next_connection_id();
 
         self.subscribers
             .upsert_async(
@@ -100,13 +102,14 @@ impl MultiPeerBackend for XPubSocketBackend {
                 XPubSubscriber {
                     subscriptions: vec![],
                     send_queue: Arc::new(AsyncMutex::new(Box::pin(send_queue))),
+                    connection_id,
                 },
             )
             .await;
 
         self.fair_queue_inner
             .lock()
-            .insert(peer_id.clone(), recv_queue);
+            .insert_connection(peer_id.clone(), connection_id, recv_queue);
     }
 
     fn peer_disconnected(&self, peer_id: &PeerIdentity) {
@@ -117,12 +120,26 @@ impl MultiPeerBackend for XPubSocketBackend {
 }
 
 impl XPubSocketBackend {
-    /// [`MultiPeerBackend::peer_disconnected`] for the fair queue's disconnect
-    /// callback, which runs inside `poll_next` and must not block on the peer map.
-    async fn peer_disconnected_async(&self, peer_id: &PeerIdentity) {
+    /// [`MultiPeerBackend::peer_disconnected`] for async code, which must not
+    /// wait on the subscriber map synchronously.
+    ///
+    /// With `Some(connection_id)` it removes the subscriber only if that
+    /// connection is still the registered one, and does nothing otherwise.
+    async fn peer_disconnected_async(&self, peer_id: &PeerIdentity, connection_id: Option<u64>) {
+        if let Some(id) = connection_id {
+            let removed = self
+                .subscribers
+                .remove_if_async(peer_id, |subscriber| subscriber.connection_id == id)
+                .await;
+            if removed.is_none() {
+                return;
+            }
+            self.fair_queue_inner.lock().remove_connection(peer_id, id);
+        } else {
+            self.subscribers.remove_async(peer_id).await;
+            self.fair_queue_inner.lock().remove(peer_id);
+        }
         log::info!("Client disconnected {:?}", peer_id);
-        self.subscribers.remove_async(peer_id).await;
-        self.fair_queue_inner.lock().remove(peer_id);
     }
 }
 
@@ -152,13 +169,17 @@ impl SocketSend for XPubSocket {
                 sub_filter.len() <= first_frame.len()
                     && sub_filter.as_slice() == &first_frame[0..sub_filter.len()]
             }) {
-                targets.push((subscriber.key().clone(), subscriber.send_queue.clone()));
+                targets.push((
+                    subscriber.key().clone(),
+                    subscriber.connection_id,
+                    subscriber.send_queue.clone(),
+                ));
             }
             iter = subscriber.next_async().await;
         }
 
         let mut dead_peers = Vec::new();
-        for (peer_id, send_queue) in targets {
+        for (peer_id, connection_id, send_queue) in targets {
             let res = send_queue
                 .lock()
                 .await
@@ -169,7 +190,7 @@ impl SocketSend for XPubSocket {
                 Ok(()) => {}
                 Err(CodecError::Io(e)) => {
                     if e.kind() == ErrorKind::BrokenPipe {
-                        dead_peers.push(peer_id);
+                        dead_peers.push((peer_id, connection_id));
                     } else {
                         log::error!("Error sending message: {:?}", e);
                     }
@@ -180,8 +201,10 @@ impl SocketSend for XPubSocket {
                 }
             }
         }
-        for peer in dead_peers {
-            self.backend.peer_disconnected(&peer);
+        for (peer_id, connection_id) in dead_peers {
+            self.backend
+                .peer_disconnected_async(&peer_id, Some(connection_id))
+                .await;
         }
         Ok(())
     }
@@ -195,7 +218,8 @@ impl SocketRecv for XPubSocket {
                 Some((peer_id, Ok(Message::Message(message)))) => {
                     // Process the subscription message internally to update tracking
                     self.backend
-                        .message_received(&peer_id, Message::Message(message.clone()));
+                        .message_received(&peer_id, Message::Message(message.clone()))
+                        .await;
                     // Also expose it to the application
                     return Ok(message);
                 }
@@ -203,7 +227,7 @@ impl SocketRecv for XPubSocket {
                     // Ignore non-message frames
                 }
                 Some((peer_id, Err(e))) => {
-                    self.backend.peer_disconnected(&peer_id);
+                    self.backend.peer_disconnected_async(&peer_id, None).await;
                     return Err(e.into());
                 }
                 None => {
@@ -228,10 +252,12 @@ impl Socket for XPubSocket {
         });
 
         let backend_weak = Arc::downgrade(&backend);
-        fair_queue.set_on_disconnect(move |peer_id: PeerIdentity| {
+        fair_queue.set_on_disconnect(move |peer_id: PeerIdentity, connection_id: u64| {
             if let Some(backend) = backend_weak.upgrade() {
                 crate::async_rt::task::spawn(async move {
-                    backend.peer_disconnected_async(&peer_id).await;
+                    backend
+                        .peer_disconnected_async(&peer_id, Some(connection_id))
+                        .await;
                 });
             }
         });

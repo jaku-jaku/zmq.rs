@@ -70,10 +70,12 @@ impl Socket for SubSocket {
         // Set callback to notify backend when a stream ends (peer disconnected)
         // Use Weak to avoid Arc cycle: backend -> fair_queue_inner -> callback -> backend
         let backend_weak = Arc::downgrade(&backend);
-        fair_queue.set_on_disconnect(move |peer_id: PeerIdentity| {
+        fair_queue.set_on_disconnect(move |peer_id: PeerIdentity, connection_id: u64| {
             if let Some(backend) = backend_weak.upgrade() {
                 crate::async_rt::task::spawn(async move {
-                    backend.peer_disconnected_async(&peer_id).await;
+                    backend
+                        .peer_disconnected_async(&peer_id, Some(connection_id))
+                        .await;
                 });
             }
         });
@@ -125,7 +127,7 @@ impl SocketRecv for SubSocket {
                     // not internal protocol frames like commands or greetings.
                 }
                 Some((peer_id, Err(e))) => {
-                    self.backend.peer_disconnected(&peer_id);
+                    self.backend.peer_disconnected_async(&peer_id, None).await;
                     // Handle potential errors from the fair queue
                     return Err(e.into());
                 }

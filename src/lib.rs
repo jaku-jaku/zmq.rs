@@ -71,7 +71,13 @@ pub mod __bench {
                 let (send_queue, recv_queue) = mpsc::channel(queue_capacity);
                 backend
                     .peers
-                    .upsert_async(peer_id.clone(), Peer { send_queue })
+                    .upsert_async(
+                        peer_id.clone(),
+                        Peer {
+                            send_queue,
+                            connection_id: 0,
+                        },
+                    )
                     .await;
                 backend.round_robin.push(peer_id);
                 receivers.push(recv_queue);
@@ -128,6 +134,7 @@ pub mod __bench {
                             subscriptions: subscriptions.clone(),
                             send_queue,
                             _subscription_coro_stop: stop_sender,
+                            connection_id: 0,
                         },
                     )
                     .await;

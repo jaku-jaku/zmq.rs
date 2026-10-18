@@ -10,9 +10,21 @@ use std::future::Future;
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Id of one peer connection, unique in the process.
+///
+/// A peer identity can come back on a new connection before the deferred
+/// clean-up of the old one runs. The clean-up compares this id, so it never
+/// removes the newer connection.
+pub(crate) fn next_connection_id() -> u64 {
+    NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Clone)]
 pub struct PeerIdentity(Bytes);

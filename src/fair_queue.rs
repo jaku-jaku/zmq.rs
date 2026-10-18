@@ -3,6 +3,7 @@ use futures::Stream;
 use parking_lot::Mutex;
 
 use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
 use std::pin::Pin;
@@ -14,16 +15,25 @@ pub(crate) struct QueueInner<S, K: Clone> {
     counter: atomic::AtomicUsize,
     ready_queue: BinaryHeap<ReadyEvent<K>>,
     queued: HashSet<K>,
-    streams: HashMap<K, Pin<Box<S>>>,
+    /// Each stream with the connection id it was inserted with.
+    streams: HashMap<K, (u64, Pin<Box<S>>)>,
     waker: Option<Waker>,
-    /// Callback invoked when a stream ends (peer disconnected).
+    /// Callback invoked when a stream ends (peer disconnected), with the
+    /// stream's key and connection id.
     /// Wrapped in Arc so it can be cloned and called outside the lock.
-    on_disconnect: Option<Arc<dyn Fn(K) + Send + Sync>>,
+    on_disconnect: Option<Arc<dyn Fn(K, u64) + Send + Sync>>,
 }
 
 impl<S, K: Clone + Eq + Hash> QueueInner<S, K> {
+    #[cfg(any(test, feature = "bench-internals"))]
     pub fn insert(&mut self, k: K, s: S) {
-        self.streams.insert(k.clone(), Box::pin(s));
+        self.insert_connection(k, 0, s);
+    }
+
+    /// Inserts the stream of connection `connection_id`, replacing any stream
+    /// under the same key.
+    pub fn insert_connection(&mut self, k: K, connection_id: u64, s: S) {
+        self.streams.insert(k.clone(), (connection_id, Box::pin(s)));
         self.push_ready(k);
         if let Some(w) = &self.waker {
             w.wake_by_ref();
@@ -33,6 +43,25 @@ impl<S, K: Clone + Eq + Hash> QueueInner<S, K> {
     pub fn remove(&mut self, k: &K) {
         self.streams.remove(k);
         self.queued.remove(k);
+    }
+
+    /// Removes the stream under `k` only if it belongs to `connection_id`.
+    pub fn remove_connection(&mut self, k: &K, connection_id: u64) {
+        if matches!(self.streams.get(k), Some((id, _)) if *id == connection_id) {
+            self.remove(k);
+        }
+    }
+
+    /// Puts back a stream taken out for polling, unless a newer connection
+    /// took its key meanwhile. Returns `false` if the stream was dropped.
+    fn put_back(&mut self, k: K, connection_id: u64, s: Pin<Box<S>>) -> bool {
+        match self.streams.entry(k) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert((connection_id, s));
+                true
+            }
+        }
     }
 
     /// Clear all streams and the ready queue.
@@ -126,7 +155,7 @@ where
 
         while remaining_ready > 0 {
             remaining_ready -= 1;
-            let (event, mut io_stream) = {
+            let (event, connection_id, mut io_stream) = {
                 let mut inner = fair_queue.inner.lock();
                 inner.waker = Some(cx.waker().clone());
                 let event = match inner.ready_queue.pop() {
@@ -141,7 +170,7 @@ where
                 };
                 inner.queued.remove(&event.key);
                 match inner.streams.remove(&event.key) {
-                    Some(stream) => (event, stream),
+                    Some((connection_id, stream)) => (event, connection_id, stream),
                     None => continue,
                 }
             };
@@ -157,8 +186,9 @@ where
                     let key = event.key.clone();
                     let item = Some((key.clone(), res));
                     let mut inner = fair_queue.inner.lock();
-                    inner.streams.insert(event.key, io_stream);
-                    inner.push_ready(key);
+                    if inner.put_back(event.key, connection_id, io_stream) {
+                        inner.push_ready(key);
+                    }
                     return Poll::Ready(item);
                 }
                 Poll::Ready(None) => {
@@ -171,14 +201,16 @@ where
                     };
                     // Call callback outside the lock
                     if let Some(callback) = callback {
-                        callback(event.key.clone());
+                        callback(event.key.clone(), connection_id);
                     }
                     // Continue to poll other streams instead of returning None immediately.
                     continue;
                 }
                 Poll::Pending => {
-                    let mut inner = fair_queue.inner.lock();
-                    inner.streams.insert(event.key, io_stream);
+                    fair_queue
+                        .inner
+                        .lock()
+                        .put_back(event.key, connection_id, io_stream);
                     continue;
                 }
             }
@@ -218,10 +250,11 @@ impl<S, K: Clone> FairQueue<S, K> {
 
     /// Set a callback to be invoked when a stream ends (peer disconnected).
     ///
-    /// The callback receives the key of the disconnected stream.
+    /// The callback receives the key and the connection id of the
+    /// disconnected stream.
     pub fn set_on_disconnect<F>(&mut self, callback: F)
     where
-        F: Fn(K) + Send + Sync + 'static,
+        F: Fn(K, u64) + Send + Sync + 'static,
     {
         self.inner.lock().on_disconnect = Some(Arc::new(callback));
     }
@@ -573,7 +606,7 @@ mod test {
         let poll_count: usize = lock
             .streams
             .values_mut()
-            .map(|stream| {
+            .map(|(_, stream)| {
                 let UnifiedStream::CountPending(stream) = stream.as_mut().get_mut() else {
                     panic!("unexpected stream type");
                 };
@@ -619,7 +652,7 @@ mod test {
             1,
             "wake generated during poll should be tracked as queued"
         );
-        let stream = lock.streams.get_mut("pending").unwrap();
+        let (_, stream) = lock.streams.get_mut("pending").unwrap();
         let UnifiedStream::WakePending(stream) = stream.as_mut().get_mut() else {
             panic!("unexpected stream type");
         };
@@ -627,5 +660,38 @@ mod test {
             stream.poll_count, 1,
             "FairQueue should not consume same-poll wake events immediately"
         );
+    }
+
+    #[async_rt::test]
+    async fn an_ended_stream_reports_its_own_connection_id() {
+        let mut fair_queue = FairQueue::new(false);
+        let ended = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = ended.clone();
+        fair_queue.set_on_disconnect(move |key, connection_id| {
+            seen.lock().push((key, connection_id));
+        });
+        fair_queue
+            .inner()
+            .lock()
+            .insert_connection("peer", 7, stream::iter(vec!["a"]));
+
+        assert_eq!(Some(("peer", "a")), fair_queue.next().await);
+        assert_eq!(None, fair_queue.next().await);
+        assert_eq!(vec![("peer", 7)], *ended.lock());
+    }
+
+    #[test]
+    fn removing_an_old_connection_keeps_a_newer_one_with_the_same_key() {
+        let fair_queue = FairQueue::<stream::Iter<std::vec::IntoIter<&str>>, &str>::new(false);
+        let inner = fair_queue.inner();
+        let mut lock = inner.lock();
+        lock.insert_connection("peer", 1, stream::iter(vec![]));
+        lock.insert_connection("peer", 2, stream::iter(vec![]));
+
+        lock.remove_connection(&"peer", 1);
+        assert!(lock.streams.contains_key("peer"));
+
+        lock.remove_connection(&"peer", 2);
+        assert!(!lock.streams.contains_key("peer"));
     }
 }

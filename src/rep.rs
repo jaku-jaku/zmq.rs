@@ -7,6 +7,7 @@ use crate::*;
 use crate::{SocketType, ZmqResult};
 
 use async_trait::async_trait;
+use futures::lock::Mutex as AsyncMutex;
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 
@@ -15,7 +16,8 @@ use std::sync::Arc;
 
 struct RepPeer {
     pub(crate) _identity: PeerIdentity,
-    pub(crate) send_queue: ZmqFramedWrite,
+    pub(crate) send_queue: Arc<AsyncMutex<ZmqFramedWrite>>,
+    pub(crate) connection_id: u64,
 }
 
 struct RepSocketBackend {
@@ -51,10 +53,12 @@ impl Socket for RepSocket {
         });
 
         let backend_weak = Arc::downgrade(&backend);
-        fair_queue.set_on_disconnect(move |peer_id: PeerIdentity| {
+        fair_queue.set_on_disconnect(move |peer_id: PeerIdentity, connection_id: u64| {
             if let Some(backend) = backend_weak.upgrade() {
                 crate::async_rt::task::spawn(async move {
-                    backend.peer_disconnected_async(&peer_id).await;
+                    backend
+                        .peer_disconnected_async(&peer_id, Some(connection_id))
+                        .await;
                 });
             }
         });
@@ -87,19 +91,21 @@ impl Socket for RepSocket {
 impl MultiPeerBackend for RepSocketBackend {
     async fn peer_connected(self: Arc<Self>, peer_id: &PeerIdentity, io: FramedIo) {
         let (recv_queue, send_queue) = io.into_parts();
+        let connection_id = util::next_connection_id();
 
         self.peers
             .upsert_async(
                 peer_id.clone(),
                 RepPeer {
                     _identity: peer_id.clone(),
-                    send_queue,
+                    send_queue: Arc::new(AsyncMutex::new(send_queue)),
+                    connection_id,
                 },
             )
             .await;
         self.fair_queue_inner
             .lock()
-            .insert(peer_id.clone(), recv_queue);
+            .insert_connection(peer_id.clone(), connection_id, recv_queue);
     }
 
     fn peer_disconnected(&self, peer_id: &PeerIdentity) {
@@ -109,11 +115,23 @@ impl MultiPeerBackend for RepSocketBackend {
 }
 
 impl RepSocketBackend {
-    /// [`MultiPeerBackend::peer_disconnected`] for the fair queue's disconnect
-    /// callback, which runs inside `poll_next` and must not block on the peer map.
-    async fn peer_disconnected_async(&self, peer_id: &PeerIdentity) {
-        self.report_disconnected(peer_id);
-        self.peers.remove_async(peer_id).await;
+    /// [`MultiPeerBackend::peer_disconnected`] for async code, which must not
+    /// wait on the peer map synchronously.
+    ///
+    /// With `Some(connection_id)` it removes the peer only if that connection
+    /// is still the registered one.
+    async fn peer_disconnected_async(&self, peer_id: &PeerIdentity, connection_id: Option<u64>) {
+        let removed = match connection_id {
+            Some(id) => self
+                .peers
+                .remove_if_async(peer_id, |peer| peer.connection_id == id)
+                .await
+                .is_some(),
+            None => self.peers.remove_async(peer_id).await.is_some(),
+        };
+        if removed {
+            self.report_disconnected(peer_id);
+        }
     }
 
     fn report_disconnected(&self, peer_id: &PeerIdentity) {
@@ -146,18 +164,26 @@ impl SocketSend for RepSocket {
     async fn send(&mut self, mut message: ZmqMessage) -> ZmqResult<()> {
         match self.current_request.take() {
             Some(peer_id) => {
-                if let Some(mut peer) = self.backend.peers.get_async(&peer_id).await {
-                    if let Some(envelope) = self.envelope.take() {
-                        message.prepend(&envelope);
-                    }
-                    peer.send_queue.send(Message::Message(message)).await?;
-                    Ok(())
-                } else {
-                    Err(ZmqError::ReturnToSender {
+                let send_queue = self
+                    .backend
+                    .peers
+                    .read_async(&peer_id, |_, peer| peer.send_queue.clone())
+                    .await;
+                let Some(send_queue) = send_queue else {
+                    return Err(ZmqError::ReturnToSender {
                         reason: "Client disconnected",
                         message,
-                    })
+                    });
+                };
+                if let Some(envelope) = self.envelope.take() {
+                    message.prepend(&envelope);
                 }
+                send_queue
+                    .lock()
+                    .await
+                    .send(Message::Message(message))
+                    .await?;
+                Ok(())
             }
             None => Err(ZmqError::ReturnToSender {
                 reason: "Unable to send reply. No request in progress",
@@ -195,7 +221,7 @@ impl SocketRecv for RepSocket {
                     }
                 },
                 Some((peer_id, Err(e))) => {
-                    self.backend.peer_disconnected(&peer_id);
+                    self.backend.peer_disconnected_async(&peer_id, None).await;
                     return Err(e.into());
                 }
                 None => {
@@ -264,5 +290,40 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("recv blocked on the peer map after a disconnect");
+    }
+
+    /// A reply that waits for the peer's writer must not keep the peer's map
+    /// entry, or every other task that touches that bucket waits with it.
+    #[tokio::test]
+    async fn a_reply_waiting_for_its_writer_does_not_hold_the_peer_entry() {
+        let mut rep = RepSocket::new();
+        let endpoint = rep.bind("tcp://127.0.0.1:0").await.unwrap();
+        let mut req = ReqSocket::new();
+        req.connect(&endpoint.to_string()).await.unwrap();
+        req.send("ping".into()).await.unwrap();
+        rep.recv().await.unwrap();
+        let peer = rep.current_request.clone().unwrap();
+        let backend = rep.backend.clone();
+
+        let writer = backend
+            .peers
+            .read_async(&peer, |_, peer| peer.send_queue.clone())
+            .await
+            .unwrap();
+        let busy = writer.lock().await;
+        let reply = tokio::spawn(async move { rep.send("pong".into()).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let entry =
+            tokio::time::timeout(Duration::from_millis(500), backend.peers.get_async(&peer))
+                .await
+                .expect("the waiting reply holds the peer entry");
+        assert!(entry.is_some());
+        drop(entry);
+
+        drop(busy);
+        reply.await.unwrap().unwrap();
+        let answer = req.recv().await.unwrap();
+        assert_eq!(b"pong".as_slice(), answer.get(0).unwrap().as_ref());
     }
 }
