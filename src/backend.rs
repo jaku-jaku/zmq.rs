@@ -150,6 +150,21 @@ impl MultiPeerBackend for GenericSocketBackend {
 
     fn peer_disconnected(&self, peer_id: &PeerIdentity) {
         self.peers.remove_sync(peer_id);
+        self.forget_peer(peer_id);
+    }
+}
+
+impl GenericSocketBackend {
+    /// [`MultiPeerBackend::peer_disconnected`] for the fair queue's disconnect
+    /// callback. That callback runs inside `poll_next`, so it must not block
+    /// the runtime thread on the peer map: a task queued on the same thread
+    /// may hold the peer's entry.
+    pub(crate) async fn peer_disconnected_async(&self, peer_id: &PeerIdentity) {
+        self.peers.remove_async(peer_id).await;
+        self.forget_peer(peer_id);
+    }
+
+    fn forget_peer(&self, peer_id: &PeerIdentity) {
         match &self.fair_queue_inner {
             None => {}
             Some(inner) => {
